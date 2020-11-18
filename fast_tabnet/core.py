@@ -8,11 +8,14 @@ from fastai.tabular.all import *
 from pytorch_tabnet.tab_network import TabNetNoEmbeddings
 
 # Cell
+from pytorch_tabnet.tab_model import *
+from pytorch_tabnet.tab_network import *
+
 class TabNetModel(Module):
     "Attention model for tabular data."
     def __init__(self, emb_szs, n_cont, out_sz, embed_p=0., y_range=None,
                  n_d=8, n_a=8,
-                 n_steps=3, gamma=1.5,
+                 n_steps=3, gamma=1.3,
                  n_independent=2, n_shared=2, epsilon=1e-15,
                  virtual_batch_size=128, momentum=0.02):
         self.embeds = nn.ModuleList([Embedding(ni, nf) for ni,nf in emb_szs])
@@ -23,7 +26,7 @@ class TabNetModel(Module):
         self.tab_net = TabNetNoEmbeddings(n_emb + n_cont, out_sz, n_d, n_a, n_steps,
                                           gamma, n_independent, n_shared, epsilon, virtual_batch_size, momentum)
 
-    def forward(self, x_cat, x_cont):
+    def forward(self, x_cat, x_cont, explain=False):
         if self.n_emb != 0:
             x = [e(x_cat[:,i]) for i,e in enumerate(self.embeds)]
             x = torch.cat(x, 1)
@@ -31,12 +34,41 @@ class TabNetModel(Module):
         if self.n_cont != 0:
             x_cont = self.bn_cont(x_cont)
             x = torch.cat([x, x_cont], 1) if self.n_emb != 0 else x_cont
-        x, _ = self.tab_net(x)
+        preds, m_loss = self.tab_net(x)
+        if explain: m_explain, masks = self.tab_net.forward_masks(x)
         if self.y_range is not None:
-            x = (self.y_range[1]-self.y_range[0]) * torch.sigmoid(x) + self.y_range[0]
-        return x
+            x = (self.y_range[1]-self.y_range[0]) * torch.sigmoid(preds) + self.y_range[0]
+        if explain:
+            return preds, m_loss, m_explain, masks
+        else:
+            return preds
 
 # Internal Cell
 @patch
 def size(x:nn.Module, with_grad: bool=True) -> Int:
     return sum(p.numel() for p in x.parameters() if p.requires_grad or not with_grad)
+
+# Cell
+@patch
+def explain(x:Learner, dl:TabDataLoader):
+    "Get explain values for a set of predictions"
+    dec_y = []
+    x.model.eval()
+    for batch_nb, data in enumerate(dl):
+        with torch.no_grad():
+            out, M_loss, M_explain, masks = x.model(data[0], data[1], True)
+        M_loss, M_explain = map(Tensor.cpu, (M_loss, M_explain))
+        for key, value in masks.items():
+            masks[key] = csc_matrix.dot(value.cpu().numpy(), emb_reducer)
+
+        explain = csc_matrix.dot(M_explain.numpy(), emb_reducer)
+        if batch_nb == 0:
+            res_explain = explain
+            res_masks = masks
+        else:
+            res_explain = np.vstack([res_explain, explain])
+            for key, value in masks.items():
+                res_masks[key] = np.vstack([res_masks[key], value])
+
+        dec_y.append(int(learn.loss_func.decodes(out)))
+    return dec_y, res_masks, res_explain
